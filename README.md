@@ -145,6 +145,35 @@ Three things are worth knowing about a new checkout:
   image reports the `fallback_version` from `pyproject.toml` rather than a
   version derived from the tags.
 
+## Hackbot backouts
+
+Hackbot can request a server-generated backout using its headless API bearer token:
+
+```http
+POST /api/repo/{repo_name}
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{"actions": [{"action": "revert", "commit": "<full 40-character Git SHA>", "reason": "Causes startup failures"}]}
+```
+
+The authenticated user's email must be `hackbot@mozilla.tld`. The allowed repository
+is `firefox-autoland` in production, `staging-firefox-autoland` in staging, and
+`ff-test-dev` in development. Other environments are denied. This exception grants
+no access to other automation actions and requires no general direct-push permission.
+
+Requests must contain exactly one revert action, no `relbranch`, and a nonblank
+reason. The reason is published in the generated commit message. Only non-root,
+non-merge commits already on the target branch are supported. Conflicts and empty
+backouts fail without pushing. A `202` response means the job was queued; poll its
+`status_url` to determine whether it landed or failed.
+
+For rollout, apply migrations, enable automation on the named repository, and
+assign it to a running Git automation worker. Deploy workers supporting `revert`
+before accepting requests. Verify a backout in development, then staging, before
+enabling production. Existing landing checks and push retries apply; automation
+workers do not wait for an open tree.
+
 ## General Tips
 
 ### Add a new migration

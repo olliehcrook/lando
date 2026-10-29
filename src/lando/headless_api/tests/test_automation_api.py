@@ -533,6 +533,92 @@ def automation_worker(landing_worker_instance):
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("outcome", ["success", "invalid", "conflict", "failed-check"])
+@mock.patch("lando.api.legacy.workers.automation_worker.GitHubAPIClient")
+def test_automation_revert_request(
+    github_client,
+    outcome,
+    client,
+    headless_user,
+    settings,
+    repo_mc,
+    automation_worker,
+    mock_phab_trigger_repo_update_apply_async,
+):
+    from lando.environments import Environment
+
+    settings.ENVIRONMENT = Environment.development
+    user, token = headless_user
+    user.email = "hackbot@mozilla.tld"
+    user.save()
+    user.user_permissions.clear()
+    repo = repo_mc(SCMType.GIT, name="ff-test-dev")
+    seed = Path(repo.pull_path)
+
+    def commit(content):
+        (seed / "backout-test").write_text(content)
+        subprocess.run(["git", "add", "backout-test"], cwd=seed, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Bug 123 - Startup change"], cwd=seed, check=True
+        )
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=seed, text=True
+        ).strip()
+
+    commit("base\n")
+    target = commit("broken\n")
+    if outcome == "conflict":
+        commit("later change\n")
+    if outcome == "invalid":
+        target = "0" * 40
+    original = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=seed, text=True
+    ).strip()
+    response = client.post(
+        f"/api/repo/{repo.name}",
+        data={
+            "actions": [
+                {
+                    "action": "revert",
+                    "commit": target,
+                    "reason": "Startup failure a=release",
+                }
+            ]
+        },
+        content_type="application/json",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 202, response.content
+    job = AutomationJob.objects.get(id=response.json()["job_id"])
+    automation_worker.worker_instance.applicable_repos.add(repo)
+    with mock.patch(
+        "lando.api.legacy.workers.automation_worker.LandingChecks.run",
+        return_value=["Blocked"] if outcome == "failed-check" else [],
+    ) as checks:
+        assert automation_worker.run_job(job)
+    job.refresh_from_db()
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=seed, text=True
+    ).strip()
+    if outcome == "success":
+        assert job.status == JobStatus.LANDED, job.error
+        assert head == job.landed_commit_id
+        assert head != original
+        assert job.target_repo.scm.describe_commit(head).reverted_commit_hashes() == [
+            target
+        ]
+        checks.assert_called_once()
+        assert Push.objects.filter(repo=repo).exists()
+    else:
+        assert job.status == JobStatus.FAILED, job.error
+        assert head == original
+        if outcome == "failed-check":
+            checks.assert_called_once()
+        else:
+            checks.assert_not_called()
+
+
+@pytest.mark.django_db
 def test_automation_job_add_commit_success_git(
     automation_worker,
     repo_mc,

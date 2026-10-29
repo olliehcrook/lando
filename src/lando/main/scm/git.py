@@ -215,6 +215,48 @@ class GitSCM(AbstractSCM):
         """Use `git cherry-pick` to apply the commit to the current branch."""
         self._git_run("cherry-pick", commit_id, cwd=self.path)
 
+    @override
+    def revert_commit(self, commit_id: str, reason: str) -> str:
+        """Create a backout, leaving the original checkout clean on failure."""
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", commit_id):
+            raise ValueError("A full Git commit SHA is required.")
+        if not reason.strip() or "\x00" in reason:
+            raise ValueError("A nonblank reason without null bytes is required.")
+        if not self.commit_exists(commit_id):
+            raise ValueError("The target must identify a Git commit.")
+        original_head = self.head_ref()
+        commit = self.describe_commit(commit_id)
+        if len(commit.parents) != 1:
+            raise ValueError("Root and merge commits cannot be reverted.")
+        self._git_run(
+            "merge-base", "--is-ancestor", commit.hash, original_head, cwd=self.path
+        )
+        subject = commit.desc.partition("\n")[0]
+        message = (
+            f'Revert "{subject}"\n\n'
+            f"This reverts commit {commit.hash}.\n\n"
+            f"Reason: {reason.strip()}"
+        )
+        try:
+            self._git_run("revert", "--no-commit", commit.hash, cwd=self.path)
+            self._git_run("commit", "-m", message, cwd=self.path)
+            return self.head_ref()
+        except Exception as exc:
+            try:
+                conflicts = self.collect_conflicts()
+            finally:
+                try:
+                    self._git_run("revert", "--abort", cwd=self.path)
+                except SCMException:
+                    # A single-commit revert or a commit failure may have no sequencer.
+                    pass
+                self.reset_to_commit(original_head)
+            if conflicts:
+                raise PatchConflict(
+                    f"Conflict while reverting {commit.hash}.", conflicts=conflicts
+                ) from exc
+            raise
+
     @property
     @override
     def supports_3way_apply(self) -> bool:

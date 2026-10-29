@@ -5,6 +5,7 @@ import logging
 from io import StringIO
 from typing import Annotated, Literal
 
+from django.conf import settings
 from django.core.handlers.wsgi import WSGIRequest
 from django.db import transaction
 from ninja import (
@@ -15,6 +16,7 @@ from ninja.responses import codes_4xx
 from ninja.security import HttpBearer
 from pydantic import AfterValidator, Field, TypeAdapter
 
+from lando.environments import Environment
 from lando.headless_api.models.automation_job import (
     AutomationAction,
     AutomationJob,
@@ -33,6 +35,21 @@ from lando.main.scm.helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+# shortcut: Hackbot-only rollout, replace with scoped permissions when access expands.
+REVERT_REPOS = {
+    Environment.production: "firefox-autoland",
+    Environment.staging: "staging-firefox-autoland",
+    Environment.development: "ff-test-dev",
+}
+
+
+def validate_revert_reason(value: str) -> str:
+    """Require a public explanation that can be written to a commit message."""
+    value = value.strip()
+    if not value or "\x00" in value:
+        raise ValueError("A nonblank reason without null bytes is required.")
+    return value
 
 
 def reject_cli_flags(value: str) -> str:
@@ -286,6 +303,35 @@ class MergeOntoAction(Schema):
         return True
 
 
+class RevertAction(Schema):
+    """Generate a backout of one commit already on the target branch."""
+
+    action: Literal["revert"]
+    commit: Annotated[
+        str, Field(min_length=40, max_length=40, pattern=r"^[0-9a-fA-F]{40}$")
+    ]
+    reason: Annotated[str, AfterValidator(validate_revert_reason)]
+
+    def process(
+        self, job: AutomationJob, repo: Repo, scm: AbstractSCM, index: int
+    ) -> bool:
+        try:
+            scm.revert_commit(self.commit, self.reason)
+        except PatchConflict as exc:
+            raise AutomationActionException(
+                message=f"Conflict while reverting commit {self.commit}, action #{index}.",
+                job_action=JobAction.FAIL,
+                is_fatal=False,
+            ) from exc
+        except Exception as exc:
+            raise AutomationActionException(
+                message=f"Could not revert commit {self.commit}, action #{index}. It must be a non-root, non-merge commit on the target branch with changes to revert.",
+                job_action=JobAction.FAIL,
+                is_fatal=False,
+            ) from exc
+        return True
+
+
 class TagAction(Schema):
     """Create a new tag with the given name."""
 
@@ -329,6 +375,7 @@ Action = (
     | MergeOntoAction
     | AddBranchAction
     | TagAction
+    | RevertAction
 )
 
 ActionAdapter = TypeAdapter(Action)
@@ -400,7 +447,22 @@ def post_repo_actions(
         )
         return 400, {"details": error}
 
-    if not repo.automation_enabled or not repo.required_automation_permission:
+    has_revert = any(isinstance(action, RevertAction) for action in operation.actions)
+    if has_revert:
+        if len(operation.actions) != 1 or operation.relbranch is not None:
+            return 400, {
+                "details": "Revert requests require exactly one action and no relbranch."
+            }
+        if request.user.email != "hackbot@mozilla.tld" or repo.name != REVERT_REPOS.get(
+            settings.ENVIRONMENT
+        ):
+            return 403, {
+                "details": "Reverts are restricted to Hackbot on this environment's autoland repository."
+            }
+
+    if not repo.automation_enabled or (
+        not has_revert and not repo.required_automation_permission
+    ):
         error = f"Repo {repo_name} is not enabled for automation, or the required permission is not set."
         logger.info(
             error,
@@ -408,7 +470,7 @@ def post_repo_actions(
         )
         return 400, {"details": error}
 
-    if not repo.user_can_use_automation(request.user):
+    if not has_revert and not repo.user_can_use_automation(request.user):
         error = f"User {request.user.email} is not allowed to use this API for repo {repo_name}. Missing permission: {repo.required_automation_permission}."
         logger.info(
             error,
